@@ -1223,6 +1223,103 @@ function Get-FenceMaskedText {
     return -join $parts
 }
 
+# THE OPT-IN SPAN WALK, ONCE (issue #1491). Three checks now read an author-placed
+# '<!-- <marker> -->' ... '<!-- /<marker> -->' pair and hold what is inside it against a canonical set
+# computed elsewhere: check 10 (skills:all), check 29 (skills:plugin) and check 32
+# (shared-scripts:plugin). Everything about FINDING those spans is identical between them -- the fence
+# masking, the forward walk, the three malformed-marker errors and the two symmetric sweeps -- and
+# only what happens INSIDE a span differs.
+#
+# WHY THIS IS A FUNCTION AND NOT A THIRD COPY, and the argument is measured in this file rather than
+# borrowed: checks 10 and 29 were the same walk written twice, and they DIVERGED. The nested-BEGIN
+# case -- a second opener pasted inside an already-open span, which pairs across the whole span and
+# comes out green for the wrong reason -- was reported by neither, was found while walking into it on
+# check 29's branch, and had to be repaired in BOTH places on August 26, 2026. Check 10's own comment
+# at that fix says so. A third hand-written copy would have been the third place to repair, and the
+# one most likely to be missed: it is the copy nobody remembers exists.
+#
+# THE BODY WRITES THROUGH '$script:'. A scriptblock invoked with '&' runs in a CHILD scope, so a bare
+# '$spanCount++' inside one would increment a local that dies with the call. Every caller's counters
+# are therefore $script:-scoped, deliberately and visibly, rather than returned and accumulated here:
+# what a body counts differs per check (spans, claims, both), and a walk that has to be told how to
+# add up its callers' figures is a walk that knows too much about them.
+function Invoke-MarkedSpanWalk {
+    param(
+        # The document, already fence-masked by the caller. Masked and RAW are both passed because the
+        # two existing checks legitimately differ on which they read inside a span: check 10 reads the
+        # mask (its claims are backticks, and a fenced block inside a span would otherwise claim
+        # names), check 29 reads the raw text (its claims are link targets, which must stay
+        # byte-exact). The mask is same-length and same-newlines, so one set of offsets addresses both.
+        [Parameter(Mandatory)][AllowEmptyString()][string]$MaskedText,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$RawText,
+        # The marker's inner text -- 'skills:all', not the whole comment. Escaped here, so a caller
+        # cannot smuggle a pattern into it.
+        [Parameter(Mandatory)][string]$Marker,
+        # The '[tag]' every finding from this walk carries, so a reader can tell which span reported.
+        [Parameter(Mandatory)][string]$Category,
+        # The repo-relative path, already formed, for the message.
+        [Parameter(Mandatory)][string]$Rel,
+        # Invoked once per well-formed span with a single hashtable argument: SpanStart, SpanEnd
+        # (offsets into either text) and BeginLineNo (for the message). The body reports its own
+        # findings through Add-Error and counts through $script: variables of its own.
+        [Parameter(Mandatory)][scriptblock]$OnSpan
+    )
+    $m = [regex]::Escape($Marker)
+    $beginRegex = [regex]"<!--\s*$m\s*-->"
+    $endRegex = [regex]"<!--\s*/$m\s*-->"
+    # Every END that actually closes a valid span, by offset, so the sweep below can tell one that
+    # legitimately paired from a stray END before any BEGIN or a SECOND END inside an already-open
+    # span (this walk only ever consumes the FIRST END after a BEGIN, so a duplicate further down
+    # would otherwise sit there as silent, unchecked prose).
+    $consumedEndIndices = New-Object System.Collections.Generic.HashSet[int]
+    # Its mirror: every BEGIN this walk VISITS. A second BEGIN pasted INSIDE an already-open span is
+    # never visited at all -- the walk jumps from a span's opener straight past its END -- so without
+    # this it pairs across the span and the run comes out green for the wrong reason.
+    $visitedBeginIndices = New-Object System.Collections.Generic.HashSet[int]
+    $searchStart = 0
+    while ($searchStart -le $MaskedText.Length) {
+        $beginMatch = $beginRegex.Match($MaskedText, $searchStart)
+        if (-not $beginMatch.Success) { break }
+        [void]$visitedBeginIndices.Add($beginMatch.Index)
+        $beginLineNo = 1 + [regex]::Matches($MaskedText.Substring(0, $beginMatch.Index), "`n").Count
+        $spanStart = $beginMatch.Index + $beginMatch.Length
+        $endMatch = $endRegex.Match($MaskedText, $spanStart)
+        if (-not $endMatch.Success) {
+            # An unpaired marker is a hard error, never a silent pass -- same principle as the
+            # BEGIN-without-END guard in agent-shared-lib.ps1's Expand-AgentDefShared (check 7): a
+            # typo'd sentinel must not read as "no span here". Keep scanning past it, rather than
+            # abandoning the file, so a later well-formed pair is still checked. (A BEGIN inside a
+            # fence never reaches here at all -- it was masked to whitespace before the match.)
+            Add-Error "[$Category] ${Rel}: '<!-- $Marker -->' at line $beginLineNo has no matching '<!-- /$Marker -->'."
+            $searchStart = $spanStart
+            continue
+        }
+        [void]$consumedEndIndices.Add($endMatch.Index)
+        $searchStart = $endMatch.Index + $endMatch.Length
+        & $OnSpan @{
+            SpanStart   = $spanStart
+            SpanEnd     = $endMatch.Index
+            BeginLineNo = $beginLineNo
+        }
+    }
+    # Symmetric sweep, both directions. The walk above only ever moves forward from a BEGIN, so an END
+    # before any BEGIN, and a BEGIN inside an already-open span, are never visited by it -- each would
+    # otherwise vanish into ordinary, unchecked prose instead of being reported.
+    foreach ($em in $endRegex.Matches($MaskedText)) {
+        if ($consumedEndIndices.Contains($em.Index)) { continue }
+        $endLineNo = 1 + [regex]::Matches($MaskedText.Substring(0, $em.Index), "`n").Count
+        Add-Error "[$Category] ${Rel}: '<!-- /$Marker -->' at line $endLineNo has no matching '<!-- $Marker -->'."
+    }
+    foreach ($bm in $beginRegex.Matches($MaskedText)) {
+        if ($visitedBeginIndices.Contains($bm.Index)) { continue }
+        $beginLineNo = 1 + [regex]::Matches($MaskedText.Substring(0, $bm.Index), "`n").Count
+        Add-Error ("[$Category] ${Rel}: '<!-- $Marker -->' at line $beginLineNo sits INSIDE an already-open" +
+            " span, so it is not the opener of anything -- the span that swallowed it closes at the next" +
+            " '<!-- /$Marker -->' and its contents were checked as one. Usually this means the marker was" +
+            " written in prose above a real span; show it in a fenced block instead.")
+    }
+}
+
 # Canonical skillset: every <plugin root>/skills/<name>/SKILL.md, across ALL published plugins (not
 # just the core -- an add-on team's start-task counts too). Exactly one skill-name folder between
 # 'skills' and the file, so a deeper file such as a level-3 progressive-disclosure
@@ -1259,86 +1356,45 @@ foreach ($skillsDir in (Get-PluginSubdirs -PluginRoots $publishedPlugins -Leaf '
 $skillCanonicalSet = New-Object System.Collections.Generic.HashSet[string]
 foreach ($n in $skillCanonicalList) { [void]$skillCanonicalSet.Add($n) }
 
-$skillBeginRegex = [regex]'<!--\s*skills:all\s*-->'
-$skillEndRegex = [regex]'<!--\s*/skills:all\s*-->'
+# THE WALK ITSELF IS Invoke-MarkedSpanWalk (issue #1491) -- this check keeps only what is its own: the
+# canonical set above, the claim rule below, and its counter. The fence masking, the forward walk, the
+# three malformed-marker errors and the two symmetric sweeps moved into that function when a THIRD span
+# check needed them; the note at its definition records why, and that it is this check and check 29
+# having diverged which made a third copy unacceptable.
 $skillSpanCount = 0
 foreach ($lf in $linkFiles) {
     $content = [System.IO.File]::ReadAllText($lf, [System.Text.Encoding]::UTF8)
+    # The cheap test first, on the RAW text, exactly as checks 29 and 32 do: masking is a split and a
+    # regex-replace per line, and the overwhelming majority of this few-hundred-document set carries no
+    # marker at all. A raw match is a superset of a masked one -- masking only ever removes markers, it
+    # never creates one -- so skipping here can never skip a file the masked scan would have found.
+    if ($content -notmatch '<!--\s*/?skills:all\s*-->') { continue }
     # Masked, not raw: a fenced example of the marker syntax must not be read as a live marker (see
     # Get-FenceMaskedText above). Same length + same newline positions as $content, so offsets
     # derived from it (line numbers, substrings) still point at the right place; a genuine span is
     # never inside a fence -- if it were, masking would make it invisible, not "found but wrong".
     $maskedContent = Get-FenceMaskedText -Text $content
     $rel = $lf.Replace($RepoRoot, '.')
-    # Every END match that actually closes a valid span is recorded here by its offset, so the
-    # sweep after the loop (below) can tell an END that legitimately paired with a BEGIN apart from
-    # one that did not -- a stray END before any BEGIN, or a SECOND END pasted inside an
-    # already-open span (the main loop below only ever consumes the FIRST END after a BEGIN, so a
-    # duplicate further down would otherwise just sit there as silent, unchecked prose instead of
-    # being reported).
-    $consumedEndIndices = New-Object System.Collections.Generic.HashSet[int]
-    # The mirror of $consumedEndIndices, added August 26, 2026 with check 29 -- see the note there. Every
-    # BEGIN this walk VISITS, so the sweep below can report a second BEGIN pasted INSIDE an already-open
-    # span. That case was silent here from the start: the walk jumps from a span's opener straight past
-    # its END, so a nested BEGIN is never visited, and the span pairs across it as though it were prose.
-    # The duplicate-END half was reported from day one; this is the same defect facing the other way, and
-    # it was found by walking into it on check 29's own branch, where a run came out green for the wrong
-    # reason. Born green here: 0 findings across the whole scan set at introduction.
-    $visitedBeginIndices = New-Object System.Collections.Generic.HashSet[int]
-    $searchStart = 0
-    while ($searchStart -le $maskedContent.Length) {
-        $beginMatch = $skillBeginRegex.Match($maskedContent, $searchStart)
-        if (-not $beginMatch.Success) { break }
-        [void]$visitedBeginIndices.Add($beginMatch.Index)
-        $beginLineNo = 1 + [regex]::Matches($maskedContent.Substring(0, $beginMatch.Index), "`n").Count
-        $spanStart = $beginMatch.Index + $beginMatch.Length
-        $endMatch = $skillEndRegex.Match($maskedContent, $spanStart)
-        if (-not $endMatch.Success) {
-            # Unpaired marker is a hard error, never a silent pass -- same principle as the
-            # BEGIN-without-END guard in agent-shared-lib.ps1's Expand-AgentDefShared (check 7): a
-            # typo'd sentinel must not read as "no span here". Keep scanning past it (rather than
-            # abandoning the whole file) so a later, well-formed pair further down still gets
-            # checked instead of being silently skipped because an earlier marker was malformed.
-            # (A BEGIN inside a fence never reaches this branch at all -- it was masked to
-            # whitespace before the match, so $skillBeginRegex simply never sees it there.)
-            Add-Error "[skill-list] ${rel}: '<!-- skills:all -->' at line $beginLineNo has no matching '<!-- /skills:all -->'."
-            $searchStart = $spanStart
-            continue
-        }
-        [void]$consumedEndIndices.Add($endMatch.Index)
-        $skillSpanText = $maskedContent.Substring($spanStart, $endMatch.Index - $spanStart)
+    Invoke-MarkedSpanWalk -MaskedText $maskedContent -RawText $content -Marker 'skills:all' `
+        -Category 'skill-list' -Rel $rel -OnSpan {
+        param($span)
+        # THE MASK, NOT THE RAW TEXT, and that is this check's own choice rather than the walk's: every
+        # backtick pair inside the span is a claimed name here, so a fenced block within a span would
+        # otherwise contribute names nobody claimed. Check 29 reads the raw text for the opposite reason.
+        $skillSpanText = $maskedContent.Substring($span.SpanStart, $span.SpanEnd - $span.SpanStart)
         $skillFoundNames = [regex]::Matches($skillSpanText, '`([^`\r\n]+)`') | ForEach-Object { $_.Groups[1].Value }
         $skillFoundSet = New-Object System.Collections.Generic.HashSet[string]
         foreach ($n in $skillFoundNames) { [void]$skillFoundSet.Add($n) }
         $skillMissing = @($skillCanonicalSet | Where-Object { -not $skillFoundSet.Contains($_) } | Sort-Object)
         $skillExtra = @($skillFoundSet | Where-Object { -not $skillCanonicalSet.Contains($_) } | Sort-Object)
         if ($skillMissing.Count -gt 0) {
-            Add-Error "[skill-list] ${rel}: <!-- skills:all --> span at line $beginLineNo is missing: $($skillMissing -join ', ')."
+            Add-Error "[skill-list] ${rel}: <!-- skills:all --> span at line $($span.BeginLineNo) is missing: $($skillMissing -join ', ')."
         }
         if ($skillExtra.Count -gt 0) {
-            Add-Error "[skill-list] ${rel}: <!-- skills:all --> span at line $beginLineNo lists name(s) that are not a known skill: $($skillExtra -join ', ')."
+            Add-Error "[skill-list] ${rel}: <!-- skills:all --> span at line $($span.BeginLineNo) lists name(s) that are not a known skill: $($skillExtra -join ', ')."
         }
-        $skillSpanCount++
-        $searchStart = $endMatch.Index + $endMatch.Length
-    }
-    # Symmetric sweep: the loop above only ever walks forward from a BEGIN, so an END that sits
-    # BEFORE any BEGIN (a lone orphan) or a SECOND END inside an already-open span (only the first
-    # one after a BEGIN gets consumed above) is never visited by it at all -- it would otherwise
-    # vanish into ordinary, unchecked prose instead of being reported. Every END match in the
-    # (already fence-masked) text that was NOT recorded as a real span's closer above is therefore
-    # a hard error here, mirroring the BEGIN-without-END error the same way.
-    foreach ($m in $skillEndRegex.Matches($maskedContent)) {
-        if ($consumedEndIndices.Contains($m.Index)) { continue }
-        $endLineNo = 1 + [regex]::Matches($maskedContent.Substring(0, $m.Index), "`n").Count
-        Add-Error "[skill-list] ${rel}: '<!-- /skills:all -->' at line $endLineNo has no matching '<!-- skills:all -->'."
-    }
-    foreach ($m in $skillBeginRegex.Matches($maskedContent)) {
-        if ($visitedBeginIndices.Contains($m.Index)) { continue }
-        $beginLineNo = 1 + [regex]::Matches($maskedContent.Substring(0, $m.Index), "`n").Count
-        Add-Error ("[skill-list] ${rel}: '<!-- skills:all -->' at line $beginLineNo sits INSIDE an already-open" +
-            " span, so it is not the opener of anything -- the span that swallowed it closes at the next" +
-            " '<!-- /skills:all -->' and its contents were checked as one. Usually this means the marker was" +
-            " written in prose above a real span; show it in a fenced block instead.")
+        # $script:-scoped because the body runs in a CHILD scope -- see the note at Invoke-MarkedSpanWalk.
+        $script:skillSpanCount++
     }
 }
 if ($skillSpanCount -eq 0) {
@@ -3078,12 +3134,10 @@ Write-Coverage -Category 'import' -Checked $importScanFiles.Count `
 # which has failed three times -- nine/twelve, thirteen/fourteen, fourteen/sixteen.
 #
 # BORN GREEN: 1 span, 16 claimed, 16 canonical, 0 findings at introduction.
-$pluginSkillBeginRegex = [regex]'<!--\s*skills:plugin\s*-->'
-$pluginSkillEndRegex = [regex]'<!--\s*/skills:plugin\s*-->'
 $pluginSkillLinkRegex = [regex]'\]\(([^)\s]+)\)'
 $pluginSkillSpanCount = 0
 $pluginSkillClaimTotal = 0
-# Cached per plugin: the walk below is cheap, but a document could carry several spans and there is no
+# Cached per plugin: the walk is cheap, but a document could carry several spans and there is no
 # reason to re-read a plugin's skills/ tree for each one.
 $pluginSkillCanonicalCache = @{}
 foreach ($lf in $linkFiles) {
@@ -3092,41 +3146,24 @@ foreach ($lf in $linkFiles) {
     # regex-replace per line, and the overwhelming majority of this few-hundred-document set carries no
     # marker at all. A raw match is a superset of a masked one -- masking only ever removes markers, it
     # never creates one -- so skipping here can never skip a file the masked scan would have found.
-    if (-not $pluginSkillBeginRegex.IsMatch($content) -and -not $pluginSkillEndRegex.IsMatch($content)) { continue }
+    if ($content -notmatch '<!--\s*/?skills:plugin\s*-->') { continue }
     $maskedContent = Get-FenceMaskedText -Text $content
     $rel = $lf.Replace($RepoRoot, '.')
     $ownerName = Get-PluginNameForPath -PluginRoots $publishedPlugins -Path $lf.Substring($RepoRoot.Length)
     $ownerRoot = $null
     if ($ownerName) { $ownerRoot = Get-PluginRootByName -PluginRoots $publishedPlugins -Name $ownerName }
-    $consumedEndIndices = New-Object System.Collections.Generic.HashSet[int]
-    # Every BEGIN the walk actually VISITS -- whether it opened a span or was reported unpaired. The
-    # sweep after the loop uses it to find the mirror image of the duplicate-END case: a SECOND BEGIN
-    # pasted INSIDE an already-open span is never visited at all, because the walk jumps from a span's
-    # opener straight past its END. Check 10 reports the duplicate END and is silent on this one; the
-    # asymmetry was found on this branch, by writing the marker in prose above a real span -- the two
-    # markers then paired across the whole table and the run came out GREEN, for the wrong reason.
-    $visitedBeginIndices = New-Object System.Collections.Generic.HashSet[int]
-    $searchStart = 0
-    while ($searchStart -le $maskedContent.Length) {
-        $beginMatch = $pluginSkillBeginRegex.Match($maskedContent, $searchStart)
-        if (-not $beginMatch.Success) { break }
-        [void]$visitedBeginIndices.Add($beginMatch.Index)
-        $beginLineNo = 1 + [regex]::Matches($maskedContent.Substring(0, $beginMatch.Index), "`n").Count
-        $spanStart = $beginMatch.Index + $beginMatch.Length
-        $endMatch = $pluginSkillEndRegex.Match($maskedContent, $spanStart)
-        if (-not $endMatch.Success) {
-            Add-Error "[skill-list-plugin] ${rel}: '<!-- skills:plugin -->' at line $beginLineNo has no matching '<!-- /skills:plugin -->'."
-            $searchStart = $spanStart
-            continue
-        }
-        [void]$consumedEndIndices.Add($endMatch.Index)
-        $searchStart = $endMatch.Index + $endMatch.Length
+    # THE WALK IS Invoke-MarkedSpanWalk (issue #1491), shared with checks 10 and 32. What stays here is
+    # only what is this check's own: the plugin resolved from the file's own path above, the link-based
+    # claim rule below, and the two counters.
+    Invoke-MarkedSpanWalk -MaskedText $maskedContent -RawText $content -Marker 'skills:plugin' `
+        -Category 'skill-list-plugin' -Rel $rel -OnSpan {
+        param($span)
         if (-not $ownerRoot) {
-            Add-Error ("[skill-list-plugin] ${rel}: <!-- skills:plugin --> span at line $beginLineNo sits in a file that" +
+            Add-Error ("[skill-list-plugin] ${rel}: <!-- skills:plugin --> span at line $($span.BeginLineNo) sits in a file that" +
                 " belongs to no published plugin, so there is no plugin whose skills it could be held against." +
                 " This marker is plugin-scoped by definition -- for a marketplace-wide enumeration use" +
                 " <!-- skills:all --> (check 10) instead.")
-            continue
+            return
         }
         if (-not $pluginSkillCanonicalCache.ContainsKey($ownerName)) {
             $ownerSkillDirs = New-Object System.Collections.Generic.HashSet[string]
@@ -3143,7 +3180,7 @@ foreach ($lf in $linkFiles) {
         # The claim set. Read from the RAW text at the same offsets, not from the mask -- the mask only
         # ever blanks fenced blocks, and a span never legitimately contains one, so the two agree here;
         # reading the raw text keeps the target byte-exact regardless.
-        $spanText = $content.Substring($spanStart, $endMatch.Index - $spanStart)
+        $spanText = $content.Substring($span.SpanStart, $span.SpanEnd - $span.SpanStart)
         $spanDir = Split-Path -Parent $lf
         $ownerSkillsPrefix = (Join-Path $ownerRoot.Root 'skills').TrimEnd('\') + '\'
         $claimed = New-Object System.Collections.Generic.HashSet[string]
@@ -3162,28 +3199,16 @@ foreach ($lf in $linkFiles) {
         $missing = @($ownerCanonical | Where-Object { -not $claimed.Contains($_) } | Sort-Object)
         $extra = @($claimed | Where-Object { -not $ownerCanonical.Contains($_) } | Sort-Object)
         if ($missing.Count -gt 0) {
-            Add-Error ("[skill-list-plugin] ${rel}: <!-- skills:plugin --> span at line $beginLineNo claims to enumerate" +
+            Add-Error ("[skill-list-plugin] ${rel}: <!-- skills:plugin --> span at line $($span.BeginLineNo) claims to enumerate" +
                 " every skill of plugin '$ownerName' but links to none for: $($missing -join ', ').")
         }
         if ($extra.Count -gt 0) {
-            Add-Error ("[skill-list-plugin] ${rel}: <!-- skills:plugin --> span at line $beginLineNo links into" +
+            Add-Error ("[skill-list-plugin] ${rel}: <!-- skills:plugin --> span at line $($span.BeginLineNo) links into" +
                 " '$ownerName'/skills/ for name(s) that ship no SKILL.md there: $($extra -join ', ').")
         }
-        $pluginSkillSpanCount++
-        $pluginSkillClaimTotal += $claimed.Count
-    }
-    foreach ($m in $pluginSkillEndRegex.Matches($maskedContent)) {
-        if ($consumedEndIndices.Contains($m.Index)) { continue }
-        $endLineNo = 1 + [regex]::Matches($maskedContent.Substring(0, $m.Index), "`n").Count
-        Add-Error "[skill-list-plugin] ${rel}: '<!-- /skills:plugin -->' at line $endLineNo has no matching '<!-- skills:plugin -->'."
-    }
-    foreach ($m in $pluginSkillBeginRegex.Matches($maskedContent)) {
-        if ($visitedBeginIndices.Contains($m.Index)) { continue }
-        $beginLineNo = 1 + [regex]::Matches($maskedContent.Substring(0, $m.Index), "`n").Count
-        Add-Error ("[skill-list-plugin] ${rel}: '<!-- skills:plugin -->' at line $beginLineNo sits INSIDE an" +
-            " already-open span, so it is not the opener of anything -- the span that swallowed it closes at" +
-            " the next '<!-- /skills:plugin -->' and its contents were checked as one. Usually this means the" +
-            " marker was written in prose above a real span; show it in a fenced block instead.")
+        # $script:-scoped because the body runs in a CHILD scope -- see the note at Invoke-MarkedSpanWalk.
+        $script:pluginSkillSpanCount++
+        $script:pluginSkillClaimTotal += $claimed.Count
     }
 }
 Write-Coverage -Category 'skill-list-plugin' -Checked $pluginSkillSpanCount `
@@ -3522,6 +3547,120 @@ foreach ($psFile in (Get-PsScriptFiles)) {
 }
 Write-Coverage -Category 'shopify-cli' -Checked $shopifyChecked `
     -Note "script file(s) parsed for a command named 'shopify' -- $shopifyFindings bare call(s). Two files are exempt by NAME, so a plugin mirror of either is exempt too: shopify-cli-lib.ps1, which holds the one permitted call, and shopify-cli.tests.ps1, whose probe invokes the CLI bare on purpose to prove the shim inherits the caller's preference. A comment or a printed hint naming the CLI is not a subject: only a CommandAst is"
+
+# --- 32. a mirror table's rows against the shared-scripts registry ----------------------------------------
+# THE FOURTH OCCURRENCE THIS EXISTS TO PREVENT (issue #1491). plugins/dkj-policy/scripts/README.md holds
+# a hand-written table of the shared scripts that land in that plugin, beside Get-SharedScriptPairs, which
+# can simply be asked. It has gone stale against that registry three times: August 15, 2026 (three rows
+# missing -- adopt-workflow-folder, session-status, source-repo-guard-lib), August 26, 2026 (the header,
+# the destination split and the row list all wrong at once), and September 6, 2026 (#1486: 21 rows short of
+# a 45-entry registry). Each repair was a hand pass, which resets the clock rather than stopping it.
+#
+# CHECK 8 IS NOT THIS, and the distinction is the whole reason a second check is needed. Check 8 holds each
+# mirror's CONTENT against its source -- it proves the file on disk is the right file. Nothing before this
+# asked whether the page that TELLS a consumer which files exist still names them all, so a script could be
+# registered, generated, mirrored byte-perfect and pass every gate while being invisible on the one page a
+# consumer reads. All three misses above were of exactly that shape.
+#
+# THE SCOPE IS THE DOCUMENT'S OWN DIRECTORY, not "this plugin". The canonical set is every registry mirror
+# that lands at or below the folder the marked document sits in, relativized against that folder -- which
+# is what makes the claims in the table (`task/new-branch.ps1`) comparable as written. Put the marker in
+# plugins/<p>/scripts/README.md and it means that folder; put it in plugins/<p>/README.md and it means the
+# whole plugin, with the deeper paths (`scripts/task/new-branch.ps1`) the table would then have to carry.
+# A file under no published plugin is a hard error rather than a silent skip, exactly as in check 29: the
+# marker's meaning is "the mirrors that land here", and a document outside the tree has made a claim
+# nothing can adjudicate.
+#
+# THE CLAIM IS THE ROW'S FIRST CELL, and this is where it differs from both siblings. Check 10 reads every
+# backtick pair in the span; check 29 reads link targets. Neither serves a three-column table whose second
+# column is running prose carrying `-Worker`, `Get-LintScript`, `Invoke-GitPark` and `CHANGELOG.md`, and
+# whose third is a link to a SKILL.md rather than to the script. The first cell IS the claim this table
+# makes -- its header says 'Script' -- so that is what is read: the first backticked token of the first
+# cell of every table row inside the span. A header row ('Script'), a separator ('---') and a prose line
+# carry no backticked first cell and are passed over without a rule of their own.
+#
+# WHY OPT-IN, like both siblings and for the third time in this file. A blanket rule -- "a plugin's
+# scripts/README.md lists every mirror" -- would need an allow-list on the day it was written: the ROOT
+# scripts/README.md is a deliberate SUBSET of the same registry (only what a person invokes by hand, as
+# its own text says), so a check keyed on filename would false-positive on every lib, hook-only script and
+# generator there. That page keeps its own question open; #1491 says so explicitly, and the sentinel is
+# what lets this one be gated without answering it. Same scar tissue as check 10's prose scan (rejected at
+# 147 hits) and the stale-path check (declined at 124, all false).
+#
+# BORN GREEN: 1 span, 45 claimed, 45 canonical, 0 findings at introduction -- measured on the trunk the
+# hour after #1490 folded, which is the state that made gating this table possible at all.
+$mirrorRowRegex = [regex]'(?m)^[ \t]*\|([^|\r\n]*)\|'
+$mirrorTokenRegex = [regex]'`([^`\r\n]+)`'
+$mirrorSpanCount = 0
+$mirrorClaimTotal = 0
+# THE CANONICAL SIDE IS REPORTED TOO, and it is not decoration. This check is silent when BOTH sets come
+# back empty, and empty-versus-empty is the exact way a span check fails invisibly: it happened on this
+# branch, where a mangled regex emptied check 29's two sets and the whole gate reported 0 errors while
+# that check asserted nothing. What exposed it was its claim count read against a known baseline. A claim
+# count alone would not have: 0 rows against 0 mirrors and 45 against 45 both report "no findings", so the
+# figure that distinguishes them has to be printed beside it.
+$mirrorCanonicalTotal = 0
+foreach ($lf in $linkFiles) {
+    $content = [System.IO.File]::ReadAllText($lf, [System.Text.Encoding]::UTF8)
+    # The cheap raw test first, as in checks 10, 28 and 29 -- masking every document in this set to find
+    # the one that carries a marker is the cost this avoids.
+    if ($content -notmatch '<!--\s*/?shared-scripts:mirror\s*-->') { continue }
+    $maskedContent = Get-FenceMaskedText -Text $content
+    $rel = $lf.Replace($RepoRoot, '.')
+    $ownerName = Get-PluginNameForPath -PluginRoots $publishedPlugins -Path $lf.Substring($RepoRoot.Length)
+    $docDir = (Split-Path -Parent $lf).TrimEnd('\') + '\'
+    Invoke-MarkedSpanWalk -MaskedText $maskedContent -RawText $content -Marker 'shared-scripts:mirror' `
+        -Category 'shared-script-list' -Rel $rel -OnSpan {
+        param($span)
+        if (-not $ownerName) {
+            Add-Error ("[shared-script-list] ${rel}: <!-- shared-scripts:mirror --> span at line $($span.BeginLineNo) sits" +
+                " in a file that belongs to no published plugin, so there is no mirror set it could be held" +
+                " against. This marker reads the registry's mirrors that land in the marked document's OWN" +
+                " folder; a document outside every plugin has none.")
+            return
+        }
+        # THE REGISTRY READ AT THE TOP OF CHECK 8 IS REUSED, not taken again. $sharedPairs is the one
+        # Get-SharedScriptPairs call this run makes, and it already carries the resolved PluginRoots that a
+        # second call would have to re-derive outside that check's guarded try/catch.
+        $canonical = New-Object System.Collections.Generic.HashSet[string]
+        foreach ($pair in $sharedPairs) {
+            if (-not $pair.MirrorPath.StartsWith($docDir, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+            [void]$canonical.Add(($pair.MirrorPath.Substring($docDir.Length) -replace '\\', '/'))
+        }
+        # Read from the MASK: a fenced example of a table row inside the span must not be read as a claim,
+        # for the same reason check 10 reads the mask. The offsets address both texts identically.
+        $spanText = $maskedContent.Substring($span.SpanStart, $span.SpanEnd - $span.SpanStart)
+        $claimed = New-Object System.Collections.Generic.HashSet[string]
+        foreach ($row in $mirrorRowRegex.Matches($spanText)) {
+            $tok = $mirrorTokenRegex.Match($row.Groups[1].Value)
+            if (-not $tok.Success) { continue }
+            [void]$claimed.Add($tok.Groups[1].Value.Trim())
+        }
+        $missing = @($canonical | Where-Object { -not $claimed.Contains($_) } | Sort-Object)
+        $extra = @($claimed | Where-Object { -not $canonical.Contains($_) } | Sort-Object)
+        if ($missing.Count -gt 0) {
+            Add-Error ("[shared-script-list] ${rel}: <!-- shared-scripts:mirror --> span at line $($span.BeginLineNo) claims to" +
+                " list every shared script mirrored into this folder but has no row for: $($missing -join ', ')." +
+                " The registry is Get-SharedScriptPairs in scripts/lib/shared-scripts-lib.ps1; a row needs a" +
+                " description and a Skill answer, which is why this reports rather than writes it.")
+        }
+        if ($extra.Count -gt 0) {
+            Add-Error ("[shared-script-list] ${rel}: <!-- shared-scripts:mirror --> span at line $($span.BeginLineNo) has a row" +
+                " for name(s) the registry does not mirror here: $($extra -join ', '). Either the pair was" +
+                " retired from Get-SharedScriptPairs and the row outlived it, or the path is mistyped.")
+        }
+        # $script:-scoped because the body runs in a CHILD scope -- see the note at Invoke-MarkedSpanWalk.
+        $script:mirrorSpanCount++
+        $script:mirrorClaimTotal += $claimed.Count
+        $script:mirrorCanonicalTotal += $canonical.Count
+    }
+}
+Write-Coverage -Category 'shared-script-list' -Checked $mirrorSpanCount `
+    -Note $(if ($mirrorSpanCount -eq 0) {
+        "no <!-- shared-scripts:mirror --> span anywhere in the set check 4 reads. The marker is opt-in, so zero is a pass and not a gap -- but no mirror table is being held against Get-SharedScriptPairs by this run, which is the state that let the same page go stale three times"
+    } else {
+        "opt-in <!-- shared-scripts:mirror --> span(s), each held against the registry mirrors landing in the MARKED DOCUMENT'S OWN folder: $mirrorClaimTotal row(s) read from the first cell rather than from every backtick -- so prose and links elsewhere in a row cost nothing -- against $mirrorCanonicalTotal registered mirror(s). BOTH figures are printed because a silent pass needs both to be zero, which is how a span check fails invisibly. Check 8 is the sibling that proves each mirror's CONTENT; this one proves the page that names them is complete"
+    })
 
 # --- Report ---------------------------------------------------------------------------------------------
 if ($errors.Count -eq 0) {

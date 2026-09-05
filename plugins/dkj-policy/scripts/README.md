@@ -47,13 +47,22 @@ once, the split not even naming `dkj-team-shopify` as a destination, and a third
 more rows absent — every row from `task/claim-issue.ps1` down through `lib/claim-issue-lib.ps1` in the
 table above, now added. `session-status` has since gone the other way: it was removed along with `/lock`
 and `/handover` ([#957](https://github.com/DaveKJohn/claude-code-specialists/issues/957), Dave), so its
-row went with it. The table is complete against the registry as of that third measurement; nothing here
-guards against a fourth, because writing a new row still needs a description and a Skill answer rather
-than a figure a check could produce on its own.
+row went with it.
+
+**There is no fourth, because the table is now gated**
+([#1491](https://github.com/DaveKJohn/claude-code-specialists/issues/1491), September 6, 2026). The
+`shared-scripts:mirror` markers around it are read by check 32 (`[shared-script-list]`) in
+`check-plugin-integrity.ps1`, which holds each row's first cell against the mirrors `Get-SharedScriptPairs`
+lands in this folder and reports both directions — a registered script with no row, and a row the registry
+no longer mirrors. Registering a pair without writing its row now turns the gate red on the PR that
+registers it, where all three misses above were merged green and found months later. **The check reports
+rather than writes**, which is the half that has not changed: a row still needs a description and a Skill
+answer, and neither is a figure a script could produce on its own.
 
 Not every script here is reached through a skill, and the **Skill** cell says so rather than linking one, so
 an absent link is a fact rather than an oversight.
 
+<!-- shared-scripts:mirror -->
 | Script | What it is | Skill |
 |---|---|---|
 | `task/new-branch.ps1` | creates the branch AND writes its `dkj-policy/<branch>.md`, in one move — a branch is never entry-less | [`new-branch`](../skills/new-branch/SKILL.md) |
@@ -101,6 +110,7 @@ an absent link is a fact rather than an oversight.
 | `lib/worktree-lib.ps1` | reads `git worktree list --porcelain`: who holds which branch, and which tree is the primary one | none — dot-sourced lib |
 | `lib/git-identity-lib.ps1` | the identity a checkout acts as on the tracker and the identity it commits as, read once for every caller that needs either | none — dot-sourced lib |
 | `lib/claim-issue-lib.ps1` | the two decisions `claim-issue.ps1` makes: which account this checkout claims under, and whether the issue in front of it may be claimed at all | none — dot-sourced lib |
+<!-- /shared-scripts:mirror -->
 
 ## How the mirror works
 

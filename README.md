@@ -635,6 +635,47 @@ the marketplace's. Neither is generic: measured over all four plugins, a rule th
 every plugin README to list its skills would be born with 8 findings on two documents that never
 claimed to enumerate anything.
 
+### The third sibling, for a table that enumerates a folder's SHARED SCRIPTS
+
+Both markers above answer *which skills does this list*. Since September 6, 2026 a third answers
+*which shared scripts does this list*
+([#1491](https://github.com/DaveKJohn/claude-code-specialists/issues/1491)), checked by **check 32**
+(`[shared-script-list]`):
+
+```
+<!-- shared-scripts:mirror -->
+| Script | What it is | Skill |
+|---|---|---|
+| `task/new-branch.ps1` | anything at all in these two columns | anything at all |
+<!-- /shared-scripts:mirror -->
+```
+
+Its canonical set is `Get-SharedScriptPairs` — the registry in `scripts/lib/shared-scripts-lib.ps1`
+that decides which scripts are mirrored into which plugin — narrowed to the mirrors landing **at or
+below the marked document's own folder**, and relativized against it. So the same marker means one
+folder's worth of scripts in `plugins/<p>/scripts/README.md` and the whole plugin's in
+`plugins/<p>/README.md`, where the rows would then carry the deeper `scripts/…` paths. A span in a
+file under no published plugin is a hard error, exactly as for `skills:plugin`.
+
+**A claim is the row's first cell** — the first backticked token in it — and neither sibling's rule
+would serve here: the table's second column is running prose carrying backticked flags and function
+names, and its third links a `SKILL.md` rather than the script. A header row, a separator and prose
+between rows carry no backticked first cell and are passed over without a rule of their own.
+
+**This is not check 8.** That one holds each mirror's *content* against its source, so it proves the
+file on disk is the right file. Nothing before this asked whether the page that tells a consumer
+*which files exist* still names them all — which is how `plugins/dkj-policy/scripts/README.md` went
+stale against its own registry three times (three rows in August 2026, then the header and the
+destination split, then 21 rows in
+[#1486](https://github.com/DaveKJohn/claude-code-specialists/issues/1486)) while every gate stayed
+green. Each repair was a hand pass, which resets the clock rather than stopping it.
+
+Opt-in for the same measured reason as the other two: the **root** `scripts/README.md` is a
+deliberate *subset* of the same registry — only what a person invokes by hand — so a blanket rule
+keyed on filename would be born needing an allow-list for every lib, hook-only script and generator
+there. The sentinel is what lets the 1:1 table be gated without first answering the subset table's
+question.
+
 ## Where this runs: Chat, Cowork, and Claude Code
 
 Anthropic's Claude product has three relevant surfaces: **Chat** (a conversation), **Cowork** (a

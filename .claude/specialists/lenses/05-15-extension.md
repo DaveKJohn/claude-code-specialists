@@ -1553,6 +1553,57 @@ exactly as they did before the correction above. Do not revive this behind a rul
 for the source and calls that deference — that is the exact test this entry measures as structurally
 blind to the one real contradiction it has to catch.
 
+#### Check 32, and the extraction that came with it (September 6, 2026, [#1491](https://github.com/DaveKJohn/claude-code-specialists/issues/1491))
+
+**The check is the ordinary shape** — a hand-maintained list beside a registry that can be asked, gated
+by an opt-in sentinel. What is worth recording here is the two decisions that were *not* obvious, and one
+defect the branch produced and caught.
+
+**The scope is the marked document's own FOLDER, not its plugin**, which is where it parts company with
+check 29. `skills:plugin` resolves a plugin and holds the span to that plugin's whole `skills/` tree;
+`shared-scripts:mirror` narrows `Get-SharedScriptPairs` to the mirrors landing at or below the directory
+the marked document sits in, and relativizes against it. That is not a refinement of the same idea but a
+different question, and it is what makes the rows comparable **as written**: the page's own table says
+`task/new-branch.ps1`, because that is where the reader stands. A plugin-scoped implementation passes
+every scenario in the suite except 48, which is why 48 exists.
+
+**The claim is the row's first cell**, and this is the third distinct claim rule in three span checks —
+check 10 reads every backtick, check 29 reads link targets, this one reads the first backticked token of
+each table row. That is not drift: the subject picks the rule. This table's second column is running prose
+carrying `-Worker`, `Get-LintScript` and `Invoke-GitPark`, and its third links a `SKILL.md` rather than the
+script, so under either sibling's rule the correct page reports phantom rows. Check 10's answer to that is
+an author condition — *wrap tightly* — which this table cannot meet without being rewritten to satisfy a
+checker, and check 29's own comment already refuses that trade for the same reason.
+
+**AND THE EXTRACTION, which is the part to read before touching any of the three.** Checks 10 and 29 were
+the same forty-five-line walk written twice — fence masking, the forward scan, the unpaired-BEGIN error,
+the orphan-END sweep, the nested-BEGIN sweep — and they had **diverged**. The nested-BEGIN case was silent
+in check 10 from the day it was written, was found only while walking into it on check 29's branch, and had
+to be repaired in both places on August 26, 2026. A third hand-written copy would have been the third place
+to repair and the one most likely to be missed, so the walk became `Invoke-MarkedSpanWalk` and all three
+checks now call it. The suites are what made that safe to do: 108 asserts across checks 4/10/28/29/30
+passed unchanged before a line of check 32 was written.
+
+**The defect the branch produced, because it is the exact failure this gate exists to prevent.** Splicing
+the rewritten check 29 into the file through a shell heredoc silently ate the doubled backslashes in two
+regex literals: `'\\skills\\[^\\]+\\SKILL\.md$'` landed as `'\skills\[^\]+\SKILL\.md$'`, which matches
+nothing. Both the canonical set and the claim set then came back **empty**, the comparison of empty to
+empty produced no findings, and the whole gate reported **0 errors** — green, with check 29 asserting
+nothing at all. Nothing in the findings could have shown this. What showed it was the **coverage line**
+(`Write-Coverage`, issue #221): `with 0 claim(s)` against a baseline of `17`, which is precisely the
+argument for why a verdict never travels without the count behind it. Three consequences, all acted on:
+the suite's scenario 42 asserts the derived canonical set is **non-empty** before any comparison is
+trusted; check 32's coverage line prints **both** sides — rows read *and* mirrors registered — because a
+claim count alone cannot tell `0` against `0` from `45` against `45`, and both of those report *no
+findings*; and a code splice into a `.ps1` is written with the editor tools rather than through a shell
+heredoc — the mangling class is the one already documented in the manual's PowerShell traps, arriving by
+a different route.
+
+**The middle one came out of the code review rather than out of the failure**, which is worth noting: the
+defect was in check 29, and the reviewer's question was whether the *new* check could fail the same way on
+a real run, where the suite's guard does not reach. It could — silence needs only both sets empty — and
+the answer was not a runtime assertion but the missing figure, which is the same answer #221 gave.
+
 In short: the **how** (managing the harness, scripts, config, safety guards) is portable; the **what**
 (the plugin lint + drift lint, `branch-info.ps1`, `.claude/settings.json` with the github source, and
 the marketplace/plugin manifests) belongs to this repo.

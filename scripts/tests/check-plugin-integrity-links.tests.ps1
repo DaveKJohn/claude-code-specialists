@@ -2,8 +2,9 @@
 .SYNOPSIS
     check-plugin-integrity.ps1, part 1 of 4: check 4 (the dead-link scan set), check 10 (the
     marked <!-- skills:all --> spans), check 28 (the '@'-import targets), check 29 (the
-    plugin-scoped <!-- skills:plugin --> spans) and check 30 (a plugin-shipped relative link must
-    resolve inside its own plugin), plus scenario 16 -- a root entry file is scanned before the fold.
+    plugin-scoped <!-- skills:plugin --> spans), check 30 (a plugin-shipped relative link must
+    resolve inside its own plugin) and check 32 (the <!-- shared-scripts:mirror --> tables), plus
+    scenario 16 -- a root entry file is scanned before the fold.
 
 .DESCRIPTION
     The fixture, the assert helpers and Invoke-Integrity live in check-plugin-integrity-fixture.ps1,
@@ -32,6 +33,16 @@
     into a SIBLING plugin, which satisfies the boundary inbound #1066 proposed ('stay under plugins/')
     while still being dead for a consumer, because the cache gives every plugin its own versioned
     directory and a sibling is not a neighbour.
+
+    Check 32 is the THIRD opt-in span in this file, and since #1491 all three run one walk --
+    Invoke-MarkedSpanWalk. Its eight scenarios therefore do not restage the marker mechanics checks 10
+    and 29 already prove; they cover what is its own, and two of them exist because an implementation
+    that got them wrong would pass everything else here: 45 (the claim is the row's FIRST CELL, not
+    every backtick and not a link) and 48 (the scope is the marked document's OWN FOLDER, not its
+    plugin). Its expected set is DERIVED from Get-SharedScriptPairs rather than typed, so a newly
+    shared script does not turn this suite red for having found nothing -- and 42 asserts that derived
+    set is non-empty, because comparing empty to empty is exactly how check 29 came out green for the
+    wrong reason while #1491 was being built.
 
     Check 28 is check 4's sibling -- the same scan set, a different syntax -- and its scenarios pin the
     resolution rule (file-relative, NOT repo-root-relative) separately from both discriminators (a fenced
@@ -1041,6 +1052,163 @@ try {
     Remove-Item -LiteralPath (Join-Path $Fixture 'plugins\dkj-teams\dkj-team-shopify\GUIDE.md') -Force
     $q41b = Invoke-Integrity -FixtureRoot $Fixture
     Assert-True (-not ($q41b.Out -match $PluginLinkFindingPattern)) 'scenario 41: the fixture is clean again once the notes file is gone'
+
+    # === check 32: a mirror table's rows against the shared-scripts registry ============================
+    # 42-49. WHY THESE SIT BESIDE CHECKS 10 AND 29 (issue #1491): the third opt-in span in this file, and
+    #        since this branch all three run the SAME walk -- Invoke-MarkedSpanWalk. The marker mechanics
+    #        (fence masking, unpaired BEGIN, orphan END, nested BEGIN) are therefore proven once by
+    #        check 10's and 29's scenarios and are not restaged here; 47 keeps one masking assert because
+    #        it is the one mechanic this check reads DIFFERENTLY -- through table rows rather than through
+    #        backticks or links.
+    #
+    #        THE EXPECTED SET IS DERIVED FROM THE REGISTRY, NOT TYPED. Get-SharedScriptPairs is the thing
+    #        under test's own source of truth, so hardcoding two filenames here would turn every future
+    #        `git`-shared script into a red suite that has found nothing. The tautology that invites is
+    #        answered by 42's second assert: the derived set must be NON-EMPTY, so a registry that
+    #        silently returned nothing cannot make every scenario below pass by comparing empty to empty
+    #        -- which is exactly how check 29 came out green for the wrong reason while this branch was
+    #        being written.
+    #
+    #        THE DOCUMENT IS plugins/teams/team-alpha/scripts/README.md, and the folder is the point: this
+    #        check scopes to the marked document's OWN directory rather than to its plugin. Scenario 48
+    #        asserts that head-on by moving the same marker up to the plugin root, where the canonical set
+    #        keeps the deeper 'scripts/' prefix -- the assertion that a plugin-scoped implementation
+    #        (which would pass every other scenario here) fails.
+    $MirrorFindingPattern = '\[shared-script-list\].*(has no row for:|does not mirror here:|has no matching|sits INSIDE|belongs to no published plugin)'
+    $mirrorReadme = Join-Path $Fixture 'plugins\teams\team-alpha\scripts\README.md'
+    New-Item -ItemType Directory -Path (Split-Path -Parent $mirrorReadme) -Force | Out-Null
+
+    # What the registry says lands in that folder, resolved against the FIXTURE, exactly as the check
+    # resolves it. Sorted so the table below is stable run to run.
+    . (Join-Path $PSScriptRoot '..\lib\shared-scripts-lib.ps1')
+    $mirrorDocDir = (Split-Path -Parent $mirrorReadme).TrimEnd('\') + '\'
+    $mirrorExpected = @(
+        Get-SharedScriptPairs -RepoRoot $Fixture -PluginRoots @(Get-RepoPluginRoots -RepoRoot $Fixture) |
+            Where-Object { $_.MirrorPath.StartsWith($mirrorDocDir, [System.StringComparison]::OrdinalIgnoreCase) } |
+            ForEach-Object { $_.MirrorPath.Substring($mirrorDocDir.Length) -replace '\\', '/' } | Sort-Object)
+
+    function New-MirrorTable {
+        # Builds the table body the way the real page writes it: a backticked path in the first cell,
+        # running prose in the second, a link or the word 'none' in the third.
+        param([string[]]$Rows)
+        $out = @('| Script | What it is | Skill |', '|---|---|---|')
+        foreach ($r in $Rows) { $out += "| ``$r`` | what it does | none -- dot-sourced lib |" }
+        return $out
+    }
+
+    # --- Scenario 42: a table carrying every registered mirror passes, and the set is not empty --------
+    Write-Host "check 32 -- a complete <!-- shared-scripts:mirror --> table passes" -ForegroundColor Cyan
+    $p42Lines = @('# scripts', '', '<!-- shared-scripts:mirror -->') + (New-MirrorTable -Rows $mirrorExpected) + @('<!-- /shared-scripts:mirror -->')
+    [System.IO.File]::WriteAllText($mirrorReadme, (($p42Lines -join "`n") + "`n"), $Utf8NoBom)
+
+    $q42 = Invoke-Integrity -FixtureRoot $Fixture
+    Assert-True (-not ($q42.Out -match $MirrorFindingPattern)) 'scenario 42: a complete mirror table reports no [shared-script-list] finding'
+    Assert-True ($mirrorExpected.Count -gt 0) 'scenario 42: the derived canonical set is NON-EMPTY -- without this every scenario below could pass by comparing empty to empty'
+    Assert-True ($q42.Out -match [regex]::Escape('[shared-script-list] checked 1')) 'scenario 42: exactly one span was counted'
+    Assert-True ($q42.Out -match [regex]::Escape(": $($mirrorExpected.Count) row(s) read from the first cell")) 'scenario 42: every row was read as a claim -- the coverage line proves the cells were parsed, not just the markers found'
+    # The CANONICAL side, printed beside the claim side for the reason the check's own comment gives: a
+    # claim count alone cannot tell 0-against-0 from 45-against-45, and both report "no findings".
+    Assert-True ($q42.Out -match [regex]::Escape("against $($mirrorExpected.Count) registered mirror(s)")) 'scenario 42: and the registry side is reported too, so an empty-against-empty pass cannot read like a real one'
+
+    # --- Scenario 43: THE RECURRENCE THIS CHECK EXISTS FOR. A registered script with no row is named.
+    # Three hand passes (August 15, August 26, September 6 2026) repaired exactly this and reset the
+    # clock; the finding below is what ends it ----------------------------------------------------------
+    Write-Host "check 32 -- a registered mirror with no row is named" -ForegroundColor Cyan
+    $mirrorDropped = $mirrorExpected[0]
+    $p43Lines = @('# scripts', '', '<!-- shared-scripts:mirror -->') +
+        (New-MirrorTable -Rows @($mirrorExpected | Where-Object { $_ -ne $mirrorDropped })) +
+        @('<!-- /shared-scripts:mirror -->')
+    [System.IO.File]::WriteAllText($mirrorReadme, (($p43Lines -join "`n") + "`n"), $Utf8NoBom)
+
+    $q43 = Invoke-Integrity -FixtureRoot $Fixture
+    Assert-True ($q43.Out -match [regex]::Escape("has no row for: $mirrorDropped")) 'scenario 43: the unlisted mirror is named -- this is the drift the check exists to stop'
+    Assert-True ($q43.Out -match [regex]::Escape('Get-SharedScriptPairs')) 'scenario 43: and the finding names the registry to consult, so the repair needs no source reading'
+    Assert-Equal 1 $q43.Code 'scenario 43: and it fails the gate'
+
+    # --- Scenario 44: the other direction -- a row the registry does not mirror here. This is the half a
+    # "count the rows" check could never catch, and the half that fires when a pair is RETIRED ----------
+    Write-Host "check 32 -- a row for a script the registry does not mirror is reported" -ForegroundColor Cyan
+    $p44Lines = @('# scripts', '', '<!-- shared-scripts:mirror -->') +
+        (New-MirrorTable -Rows ($mirrorExpected + 'task/retired-long-ago.ps1')) +
+        @('<!-- /shared-scripts:mirror -->')
+    [System.IO.File]::WriteAllText($mirrorReadme, (($p44Lines -join "`n") + "`n"), $Utf8NoBom)
+
+    $q44 = Invoke-Integrity -FixtureRoot $Fixture
+    Assert-True ($q44.Out -match [regex]::Escape('does not mirror here: task/retired-long-ago.ps1')) 'scenario 44: the outlived row is named'
+    Assert-Equal 1 $q44.Code 'scenario 44: and it fails the gate'
+
+    # --- Scenario 45 (THE CLAIM RULE, and the one that separates this check from both siblings): only the
+    # FIRST CELL is a claim. The real page's second column carries backticked flags and function names and
+    # its third links a SKILL.md -- under check 10's every-backtick rule each would be a phantom row, and
+    # under check 29's link rule the skill pages would be. Neither reading can serve this table ----------
+    Write-Host "check 32 -- backticks and links elsewhere in a row are not claims; the first cell is" -ForegroundColor Cyan
+    $p45Lines = @('# scripts', '', '<!-- shared-scripts:mirror -->', '| Script | What it is | Skill |', '|---|---|---|')
+    foreach ($r in $mirrorExpected) {
+        $p45Lines += "| ``$r`` | pass ``-Worker`` to ``Invoke-GitPark``, see ``CHANGELOG.md`` | [``park``](../skills/park/SKILL.md) |"
+    }
+    $p45Lines += '<!-- /shared-scripts:mirror -->'
+    [System.IO.File]::WriteAllText($mirrorReadme, (($p45Lines -join "`n") + "`n"), $Utf8NoBom)
+
+    $q45 = Invoke-Integrity -FixtureRoot $Fixture
+    Assert-True (-not ($q45.Out -match $MirrorFindingPattern)) 'scenario 45: backticked flags, function names and a SKILL.md link in the other cells cost nothing -- no author condition is needed'
+    Assert-True ($q45.Out -match [regex]::Escape(": $($mirrorExpected.Count) row(s) read from the first cell")) 'scenario 45: still exactly one claim per row -- the four extra backtick runs per row were not read as names'
+
+    # --- Scenario 46: a header row, a separator and running prose inside the span are passed over without
+    # a rule of their own -- they simply carry no backticked first cell ----------------------------------
+    Write-Host "check 32 -- a header, a separator and prose inside the span are not rows" -ForegroundColor Cyan
+    $p46Lines = @('# scripts', '', '<!-- shared-scripts:mirror -->', 'Not every script here is reached through a skill.', '') +
+        (New-MirrorTable -Rows $mirrorExpected) +
+        @('', 'The registry is the only place that knows the answer.', '<!-- /shared-scripts:mirror -->')
+    [System.IO.File]::WriteAllText($mirrorReadme, (($p46Lines -join "`n") + "`n"), $Utf8NoBom)
+
+    $q46 = Invoke-Integrity -FixtureRoot $Fixture
+    Assert-True (-not ($q46.Out -match $MirrorFindingPattern)) 'scenario 46: the header, the separator and the surrounding prose produce no phantom rows'
+    Assert-True ($q46.Out -match [regex]::Escape(": $($mirrorExpected.Count) row(s) read from the first cell")) 'scenario 46: and the claim count is unchanged by them'
+
+    # --- Scenario 47: a FENCED example row is invisible, as everywhere else in this file. Asserted on the
+    # finding a masked row would produce rather than on the span count, because this check reads the mask
+    # for its ROWS where check 10 reads it for its backticks -- the mechanic is shared, the reading is not
+    Write-Host "check 32 -- a fenced example row is not a claim" -ForegroundColor Cyan
+    $p47Lines = @('# scripts', '', '<!-- shared-scripts:mirror -->') + (New-MirrorTable -Rows $mirrorExpected) +
+        @('', 'Add one like this:', '', '```', '| `task/not-a-real-mirror.ps1` | example | none |', '```', '', '<!-- /shared-scripts:mirror -->')
+    [System.IO.File]::WriteAllText($mirrorReadme, (($p47Lines -join "`n") + "`n"), $Utf8NoBom)
+
+    $q47 = Invoke-Integrity -FixtureRoot $Fixture
+    Assert-True (-not ($q47.Out -match [regex]::Escape('task/not-a-real-mirror.ps1'))) 'scenario 47: the fenced example row is masked, so it is not read as a phantom claim'
+    Assert-True ($q47.Out -match [regex]::Escape(": $($mirrorExpected.Count) row(s) read from the first cell")) 'scenario 47: and the claim count is the real table alone'
+
+    # --- Scenario 48 (THE SCOPE difference): the canonical set is the marked document's OWN FOLDER, not
+    # its plugin. The same marker one level up, in the plugin root README, must expect the deeper
+    # 'scripts/'-prefixed paths -- so the folder-relative table that passed in 42 now reports every one of
+    # its rows twice over, missing and extra. A plugin-scoped implementation passes every scenario above
+    # and fails only here, which is why this one is written ----------------------------------------------
+    Write-Host "check 32 -- the scope is the marked document's OWN folder, not its plugin" -ForegroundColor Cyan
+    Remove-Item -LiteralPath $mirrorReadme -Force
+    $mirrorRootReadme = Join-Path $Fixture 'plugins\teams\team-alpha\README.md'
+    $p48Lines = @('# team-alpha', '', '<!-- shared-scripts:mirror -->') + (New-MirrorTable -Rows $mirrorExpected) + @('<!-- /shared-scripts:mirror -->')
+    [System.IO.File]::WriteAllText($mirrorRootReadme, (($p48Lines -join "`n") + "`n"), $Utf8NoBom)
+
+    $q48 = Invoke-Integrity -FixtureRoot $Fixture
+    Assert-True ($q48.Out -match [regex]::Escape("has no row for: scripts/$($mirrorExpected[0])")) 'scenario 48: from the plugin root the canonical path keeps its scripts/ prefix -- the scope followed the document, not the plugin'
+    Assert-True ($q48.Out -match [regex]::Escape("does not mirror here: $($mirrorExpected[0])")) 'scenario 48: and the folder-relative rows that passed one level down are now extras, for the same reason'
+
+    # --- Scenario 49: a span in a document under no published plugin is refused rather than silently
+    # skipped, exactly as check 29 refuses one (scenario 31) ---------------------------------------------
+    Write-Host "check 32 -- a span outside any plugin is refused" -ForegroundColor Cyan
+    Remove-Item -LiteralPath $mirrorRootReadme -Force
+    $mirrorRootDoc = Join-Path $Fixture 'CONTRIBUTING.md'
+    $mirrorRootDocOriginal = [System.IO.File]::ReadAllText($mirrorRootDoc, [System.Text.Encoding]::UTF8)
+    $p49Lines = @('# Contributing', '', '<!-- shared-scripts:mirror -->', '| `task/whatever.ps1` | a row | none |', '<!-- /shared-scripts:mirror -->')
+    [System.IO.File]::WriteAllText($mirrorRootDoc, (($p49Lines -join "`n") + "`n"), $Utf8NoBom)
+
+    $q49 = Invoke-Integrity -FixtureRoot $Fixture
+    Assert-True ($q49.Out -match [regex]::Escape('belongs to no published plugin')) 'scenario 49: a span in a root document is refused rather than silently skipped'
+    Assert-Equal 1 $q49.Code 'scenario 49: and it fails the gate'
+
+    [System.IO.File]::WriteAllText($mirrorRootDoc, $mirrorRootDocOriginal, $Utf8NoBom)
+    $q49b = Invoke-Integrity -FixtureRoot $Fixture
+    Assert-True (-not ($q49b.Out -match $MirrorFindingPattern)) 'scenario 49: the fixture is clean again once the span is gone'
+    Assert-True ($q49b.Out -match [regex]::Escape('[shared-script-list] checked 0')) 'scenario 49: and zero spans is the opt-in pass, not a silent skip'
 
 } finally {
     if (Test-Path -LiteralPath $Fixture) { Remove-Item -Recurse -Force -LiteralPath $Fixture -ErrorAction SilentlyContinue }
