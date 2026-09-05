@@ -1,0 +1,110 @@
+# The fold-on-merge gate: folds a queue-merged PR's changelog entry, since the session that ships it
+# never sees the merge (issue #1493).
+#
+# WHAT THIS CLOSES. fold-changelog-entry.ps1 has always run from exactly one place -- ship-pr.ps1,
+# as the shipping session's own next step after its own merge call returns. The merge queue (#1492)
+# merges a PR itself, in a process that session never observes, so that step never runs: the branch's
+# dkj-policy/<branch>.md sits on the trunk, unfolded, until check-unfolded-entry.ps1 notices it after
+# the fact (a SessionStart hook, or the advisory unfolded-entry.yml push check), with nobody to fold
+# it but a human doing it by hand. This workflow is the fold running from the one place that always
+# sees a queue merge: a push to main.
+#
+# IT ADDS NO RULE OF ITS OWN, AND NO SECOND DETECTOR. It runs check-unfolded-entry.ps1 -Branch main
+# unchanged -- the exact function (Get-UnfoldedTrunkEntry) unfolded-entry.yml already reports with --
+# and only when THAT finds a leftover does it call fold-changelog-entry.ps1 -Commit -Push.
+#
+# FOLD-ALL MODE, DELIBERATELY, RATHER THAN A BRANCH DERIVED FROM THE PUSH EVENT.
+# fold-changelog-entry.ps1 already discovers every unfolded per-branch document with no branch named
+# -- the same declared-branch read check-unfolded-entry.ps1 uses -- and resolves each one's own PR via
+# its own `gh pr list` lookup keyed on that declared branch. The associated-PR API
+# (GET /repos/{owner}/{repo}/commits/{sha}/pulls) or a parse of the merge-commit message would answer
+# a question this already answers from the tree itself, for one branch per run instead of the whole
+# backlog a push might be carrying.
+#
+# contents: write + pull-requests: read, AND NOTHING ELSE. pull-requests: read is not optional: the
+# fold step's own `gh pr list` needs it, and declaring any permissions block at all sets every unlisted
+# scope to none.
+#
+# INERT UNTIL THE main-ci-gate RULESET BYPASSES THE GITHUB ACTIONS APP (issue #1493). Its
+# required_status_checks rule blocks any push to main, including this job's, unless the pushing actor
+# is a listed bypass actor. Today's list is OrganizationAdmin + RepositoryRole id 5; the default
+# GITHUB_TOKEN pushes as the GitHub Actions app (integration_id 15368 -- the same id the lint-en-tests
+# required check already reports under), which is neither. Adding that app as a bypass actor is a
+# repo-settings change and therefore Dave's, not this workflow's -- until it is made, the fold step
+# below fails its own git push with a ruleset rejection, loudly, which is the correct failure mode for
+# a workflow that is code-complete and waiting on a permission it does not grant itself.
+#
+# NO CONCURRENCY CANCELLATION, unlike unfolded-entry.yml's read-only report. That workflow can safely
+# let a later push's run supersede an earlier one, because both would report the same fact a moment
+# apart. This one WRITES: cancelling a fold in progress is exactly the silent skip #1493 exists to
+# close, so every push gets its own run and none is dropped. The resulting race (two runs folding
+# close together) is already handled by fold-changelog-entry.ps1's own push-failure diagnosis, which
+# tells the two apart rather than corrupting anything.
+#
+# WINDOWS, like every other workflow that runs these scripts: they target Windows PowerShell 5.1, so
+# this runs under `shell: powershell` (5.1) rather than pwsh.
+name: Fold on merge
+
+permissions:
+  contents: write
+  pull-requests: read
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: fold-on-merge-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  fold-on-merge:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # continue-on-error is deliberate: check-unfolded-entry.ps1 exits non-zero on a genuine
+      # find, which is the case this job exists to act on, not a step failure. BUT that leaves
+      # a real crash in the detector (a git call misbehaving, an unhandled exception) exiting
+      # non-zero too, indistinguishable from "found" at the process boundary -- and the fold
+      # step below refuses to treat those the same, rather than folding blind on an outcome it
+      # cannot explain (Victor #19, pre-merge review of this branch).
+      - name: Is there an unfolded changelog entry on the trunk?
+        id: check
+        shell: powershell
+        continue-on-error: true
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/lint/check-unfolded-entry.ps1 -Branch main *>&1 | Tee-Object -FilePath check-output.txt
+          exit $LASTEXITCODE
+
+      - name: Fold it (fold-all mode -- every leftover this push may carry)
+        if: ${{ steps.check.outcome == 'failure' }}
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # The check step's own known-good signature (its [ERROR] line, verified against the
+          # live script) is what tells "a leftover was found" apart from "the script crashed for
+          # some other reason" -- both exit non-zero, and only one of them is safe to act on.
+          $checkOutput = Get-Content check-output.txt -Raw
+          if ($checkOutput -notmatch '\[ERROR\] the trunk carries') {
+            Write-Error "check-unfolded-entry.ps1 exited non-zero for a reason other than a reported leftover -- refusing to fold blind. Its output:`n$checkOutput"
+            exit 1
+          }
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts/release/fold-changelog-entry.ps1 -Commit -Push *>&1 | Tee-Object -FilePath fold-output.txt
+          $foldExitCode = $LASTEXITCODE
+
+          # The two scripts read the same trunk a moment apart and must agree: the check found a
+          # leftover, so fold-all mode reporting nothing to fold is a real disagreement between
+          # them, not a race worth swallowing -- fail loudly rather than report the job green on
+          # a fold that fixed nothing.
+          $foldOutput = Get-Content fold-output.txt -Raw
+          if ($foldOutput -match 'No entry files found to fold') {
+            Write-Error "check-unfolded-entry.ps1 reported a leftover but fold-changelog-entry.ps1 found nothing to fold -- the two disagree, which should not happen. Its output:`n$foldOutput"
+            exit 1
+          }
+          exit $foldExitCode
